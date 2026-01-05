@@ -766,7 +766,7 @@ function interface_reset($interface, $ifacecfg = false, $suspend = false)
         case 'slaac':
         case 'dhcp6':
             interface_dhcpv6_prepare($interface, $ifcfg, true);
-            killbypid('/var/run/dhcp6c.pid', 'HUP');
+            killbypid("/var/run/dhcp6c.{$device}.pid", 'HUP');
             break;
         case 'track6':
             interface_track6_configure($interface, $ifcfg);
@@ -2506,7 +2506,7 @@ function interface_track6_configure($interface, $lancfg, $reload = false)
         case 'dhcp6':
             if ($reload || !isset($lancfg['enable'])) {
                 interface_dhcpv6_prepare($lancfg['track6-interface'], $trackcfg);
-                killbypid('/var/run/dhcp6c.pid', 'HUP');
+                killbypid("/var/run/dhcp6c.{$trackcfg['if']}.pid", 'HUP');
             }
             break;
     }
@@ -2859,9 +2859,9 @@ function interface_dhcpv6_prepare($interface, $wancfg, $cleanup = false)
     }
 
     if (!$cleanup) {
-        @file_put_contents("/var/etc/dhcp6c_{$interface}.conf", $dhcp6cconf);
+        @file_put_contents("/var/etc/dhcp6c.{$device}.conf", $dhcp6cconf);
     } else {
-        @unlink("/var/etc/dhcp6c_{$interface}.conf");
+        @unlink("/var/etc/dhcp6c.{$device}.conf");
     }
 
     $dhcp6cscript = <<<EOF
@@ -2870,6 +2870,7 @@ function interface_dhcpv6_prepare($interface, $wancfg, $cleanup = false)
 case \${REASON} in
 INFOREQ|REBIND|RENEW|REQUEST|SOLICIT)
     /usr/bin/logger -t dhcp6c "dhcp6c_script: \${REASON} on {$device} executing"
+    env | sort > /tmp/dhp6c.env
 
     ARGS=
     for NAMESERVER in \${new_domain_name_servers}; do
@@ -2918,40 +2919,22 @@ EOF;
     @file_put_contents("/var/etc/dhcp6c_{$interface}_script.sh", $dhcp6cscript);
     @chmod("/var/etc/dhcp6c_{$interface}_script.sh", 0755);
 
-    $dhcp6ccommand = exec_safe('/usr/local/sbin/dhcp6c -c %s -p %s', [
-            '/var/etc/dhcp6c.conf',
-            '/var/run/dhcp6c.pid',
-    ]);
+    $cmdfrmt = ['/usr/local/sbin/dhcp6c'];
+    $cmdargs = [];
 
     if (!empty($syscfg['dhcp6_debug'])) {
-        $mode = [ '1' => ' -d', '2' => ' -D' ];
-        $dhcp6ccommand .= $mode[$syscfg['dhcp6_debug']];
+        $mode = [ '1' => '-d', '2' => '-D' ];
+        $cmdfrmt[] = $mode[$syscfg['dhcp6_debug']];
     }
 
     if (!empty($syscfg['dhcp6_norelease'])) {
-        $dhcp6ccommand .= ' -n';
+        $cmdfrmt[] = '-n';
     }
+
+    $dhcp6ccommand = exec_safe($cmdfrmt, $cmdargs);
 
     /* XXX does not exist yet: integer in seconds from 0 to n, 0 actually disables it */
     $ratimeout = $syscfg['dhcp6_ratimeout'] ?? '10';
-
-    $dhcp6cconf = '';
-
-    /* merge configs and prepare single instance of dhcp6c for startup */
-    foreach (legacy_config_get_interfaces(['enable' => true, 'virtual' => false]) as $_interface => $_wancfg) {
-        if (empty($_wancfg['ipaddrv6']) || ($_wancfg['ipaddrv6'] != 'dhcp6' && $_wancfg['ipaddrv6'] != 'slaac')) {
-            continue;
-        }
-
-        if (!file_exists("/var/etc/dhcp6c_{$_interface}.conf")) {
-            /* config file not yet rendered, defer for later */
-            continue;
-        }
-
-        $dhcp6cconf .= file_get_contents("/var/etc/dhcp6c_{$_interface}.conf");
-    }
-
-    @file_put_contents('/var/etc/dhcp6c.conf', $dhcp6cconf);
 
     $rtsold_script = <<<EOD
 #!/bin/sh
@@ -2975,17 +2958,21 @@ else
         exit 0
     fi
 fi
-if [ -f /var/run/dhcp6c.pid ]; then
-    if ! /bin/pkill -0 -F /var/run/dhcp6c.pid; then
-        rm -f /var/run/dhcp6c.pid
+CONFFILE="/var/etc/dhcp6c.\${1}.conf"
+PIDFILE="/var/run/dhcp6c.\${1}.pid"
+if [ -f "\${PIDFILE}" ]; then
+    if ! /bin/pkill -0 -F "\${PIDFILE}"; then
+        rm -f "\${PIDFILE}"
     fi
 fi
-if [ -f /var/run/dhcp6c.pid ]; then
-    /usr/bin/logger -t dhcp6c "RTSOLD script - Sending SIGHUP to dhcp6c"
-    /bin/pkill -HUP -F /var/run/dhcp6c.pid
+if [ ! -f "\${CONFFILE}" ]; then
+    /usr/bin/logger -t dhcp6c "RTSOLD script - Skipping daemon for dhcp6c.\${1}"
+elif [ -f "\${PIDFILE}" ]; then
+    /usr/bin/logger -t dhcp6c "RTSOLD script - Sending SIGHUP to dhcp6c.\${1}"
+    /bin/pkill -HUP -F "\${PIDFILE}"
 else
-    /usr/bin/logger -t dhcp6c "RTSOLD script - Starting dhcp6c daemon"
-    {$dhcp6ccommand}
+    /usr/bin/logger -t dhcp6c "RTSOLD script - Starting daemon for dhcp6c.\${1}"
+    {$dhcp6ccommand} -c "\${CONFFILE}" -p "\${PIDFILE}"
 fi
 touch "/tmp/rtsold.\${1}.done"
 
@@ -2997,7 +2984,7 @@ EOD;
 
 function DHCP6_Config_File_Basic($interface, $wancfg, $wanif, $id = 0)
 {
-    $dhcp6cconf = '';
+    $dhcp6cconf = "# generated for {$interface} in {$wancfg['ipaddrv6']} mode\n";
 
     if ($wancfg['ipaddrv6'] == 'slaac') {
         /* for SLAAC interfaces we do fire off a dhcp6 client for just our name servers */
@@ -3018,7 +3005,7 @@ function DHCP6_Config_File_Basic($interface, $wancfg, $wanif, $id = 0)
             $dhcp6cconf .= "  send ia-pd {$id}; # request prefix delegation\n";
         }
         /* XXX decide what to do with this */
-        //$dhcp6cconf .= "  send rapid-commit;\n";
+        $dhcp6cconf .= "  send rapid-commit;\n";
 
         /* XXX toggle via dhcp6_request_dns */
         $dhcp6cconf .= "  request domain-name-servers;\n";
@@ -3241,7 +3228,8 @@ function DHCP6_Config_File_Advanced($interface, $wancfg, $wanif, $id = 0)
         $key_info_statement .= "};\n";
     }
 
-    $dhcp6cconf  = $interface_statement;
+    $dhcp6cconf = "# generated for {$interface} in {$wancfg['ipaddrv6']} mode\n";
+    $dhcp6cconf .= $interface_statement;
     $dhcp6cconf .= $id_assoc_statement_address;
     $dhcp6cconf .= $id_assoc_statement_prefix;
     $dhcp6cconf .= $authentication_statement;
